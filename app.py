@@ -16,44 +16,28 @@ plt.rcParams['axes.unicode_minus'] = False
 # 1. Page layout & header
 st.set_page_config(page_title="Ardupilot Log Analyzer", layout="wide")
 
-# --- HIDE STREAMLIT BRANDING ---
+# --- HIDE STREAMLIT UI ELEMENTS ---
 hide_st_style = """
 <style>
-    /* 1. 상단 헤더(Header)는 보이게 하되, 배경색 투명하게 처리 (사이드바 버튼 살리기 위함) */
-    [data-testid="stHeader"] {
-        background-color: rgba(0,0,0,0);
-    }
+    /* 1. 사이드바 버튼이 있는 헤더는 보이게 설정 (중요) */
+    header { visibility: visible !important; }
+    [data-testid="stHeader"] { visibility: visible !important; background: transparent !important; }
 
-    /* 2. 햄버거 메뉴(사이드바 버튼)는 무조건 보이게 설정 */
-    [data-testid="collapsedControl"] {
-        display: block !important;
-    }
+    /* 2. 햄버거 메뉴(사이드바 여는 버튼)는 무조건 보이게 */
+    [data-testid="collapsedControl"] { display: block !important; }
 
-    /* 3. 우측 상단/하단 'Manage App(왕관)', 'Deploy' 버튼 숨기기 */
-    .stDeployButton {
-        display: none !important;
-    }
-    [data-testid="stToolbar"] {
-        visibility: hidden !important;
-    }
+    /* 3. 하단 푸터 숨기기 */
+    footer { display: none !important; }
+    .stApp > footer { display: none !important; }
 
-    /* 4. 프로필 사진(Running Man) 및 상태 위젯 숨기기 */
-    [data-testid="stStatusWidget"] {
-        display: none !important;
-    }
+    /* 4. 우측 상단 배포 버튼(Deploy) 숨기기 */
+    .stDeployButton { display: none !important; }
 
-    /* 5. 하단 푸터(Made with Streamlit) 숨기기 */
-    footer {
-        display: none !important;
-    }
-    .stApp > footer {
-        display: none !important;
-    }
-
-    /* 6. 모바일 하단 'Created by' 뱃지 숨기기 */
-    .viewerBadge_container__1QS1n {
-        display: none !important;
-    }
+    /* 5. 우측 상단 프로필/상태 위젯 숨기기 */
+    [data-testid="stStatusWidget"] { display: none !important; }
+    
+    /* 6. 하단 고정 뱃지(ViewerBadge) 숨기기 - 클래스명 와일드카드 사용 */
+    div[class*="viewerBadge"] { display: none !important; }
 </style>
 """
 st.markdown(hide_st_style, unsafe_allow_html=True)
