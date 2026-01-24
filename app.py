@@ -3,10 +3,14 @@ import pandas as pd
 from pymavlink import mavutil
 import tempfile
 import os
+import io
+import json
+import hashlib
+from datetime import datetime
 import matplotlib.pyplot as plt
-import folium
-from streamlit_folium import st_folium
+import pydeck as pdk
 from openai import OpenAI
+from fpdf import FPDF
 
 # Font settings
 plt.rcParams['font.family'] = 'Malgun Gothic'
@@ -19,40 +23,18 @@ MAX_CONSECUTIVE_NONE = 500
 # 1. Page layout & header
 st.set_page_config(page_title="Ardupilot Log Analyzer", layout="wide")
 
-# --- CUSTOM CSS: Sidebar Button Recovery ---
+# --- CSS 복구: 사이드바 버튼 살리기 ---
 hide_st_style = """
 <style>
-    /* 1. 헤더(Header)를 숨기지 않고 배경만 투명하게 설정 (가장 중요) */
-    header[data-testid="stHeader"] {
-        background: transparent !important;
-        visibility: visible !important;  /* 절대 숨기지 않음 */
-    }
-
-    /* 2. 사이드바 여는 버튼(>) 확실하게 보이게 설정 */
-    [data-testid="collapsedControl"] {
-        visibility: visible !important;
-        display: block !important;
-        color: #000000 !important; /* 검정색 */
-    }
+    /* 1. 하단 푸터(Made with Streamlit) 숨기기 */
+    footer {visibility: hidden;}
     
-    /* 혹시 모를 다른 ID 이름에도 대비 */
-    [data-testid="stSidebarCollapsedControl"] {
-        visibility: visible !important;
-        display: block !important;
-        color: #000000 !important;
-    }
-
-    /* 3. 오른쪽 상단 요소들(Fork, 메뉴, Deploy)만 개별적으로 숨기기 */
-    [data-testid="stToolbar"] { display: none !important; }
-    [data-testid="stHeaderActionElements"] { display: none !important; }
-    .stDeployButton { display: none !important; }
+    /* 2. 우측 하단 뱃지 숨기기 */
+    .viewerBadge_container__1QS1n {display: none !important;}
+    div[class*="viewerBadge"] {display: none !important;}
     
-    /* 4. 상단 무지개색 줄 숨기기 */
-    [data-testid="stDecoration"] { display: none !important; }
-
-    /* 5. 하단 푸터 & 뱃지 숨기기 */
-    footer { display: none !important; }
-    div[class*="viewerBadge"] { display: none !important; }
+    /* 3. 상단 헤더는 건드리지 않음 (주석 처리) -> 화살표 나옴 */
+    /* header {visibility: hidden;} */
 </style>
 """
 st.markdown(hide_st_style, unsafe_allow_html=True)
@@ -64,26 +46,127 @@ st.write("Upload an Ardupilot log file (.bin) to inspect basic info and vibratio
 if "is_pro" not in st.session_state:
     st.session_state.is_pro = False
 
-# Sidebar: Pro license login
-with st.sidebar:
-    st.header("🔑 Pro License Key")
-    pro_key = st.text_input(
-        "Pro License Key",
-        type="password",
-        help="Enter your Pro license key to unlock advanced features.",
-    )
+# --- Helper Functions for Auth ---
+DB_FILE = "users.json"
 
-    pro_password = st.secrets.get("PRO_PASSWORD", None)
-    if pro_key and pro_password and pro_key == pro_password:
-        st.session_state.is_pro = True
-        st.success("✅ Pro features unlocked!")
+def load_users():
+    if not os.path.exists(DB_FILE):
+        return {}
+    with open(DB_FILE, "r") as f:
+        return json.load(f)
+
+def save_user(username, password):
+    users = load_users()
+    hashed_pw = hashlib.sha256(password.encode()).hexdigest()
+    users[username] = hashed_pw
+    with open(DB_FILE, "w") as f:
+        json.dump(users, f)
+
+def verify_login(username, password):
+    users = load_users()
+    if username not in users:
+        return False
+    hashed_pw = hashlib.sha256(password.encode()).hexdigest()
+    return users[username] == hashed_pw
+
+with st.sidebar:
+    # --- Sidebar Authentication UI ---
+    st.title("🚁 Drone A.I.")
+
+    # Initialize Session State
+    if "is_logged_in" not in st.session_state:
+        st.session_state["is_logged_in"] = False
+    if "username" not in st.session_state:
+        st.session_state["username"] = ""
+
+    # If NOT logged in -> Show Login/Signup Menu
+    if not st.session_state["is_logged_in"]:
+        menu = st.radio("Menu", ["Login", "Sign Up"], horizontal=True)
+
+        if menu == "Login":
+            st.subheader("Login")
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            if st.button("Login"):
+                if verify_login(username, password):
+                    st.session_state["is_logged_in"] = True
+                    st.session_state["username"] = username
+                    st.success(f"Welcome back, {username}!")
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid username or password")
+
+        elif menu == "Sign Up":
+            st.subheader("Create New Account")
+            new_user = st.text_input("New Username")
+            new_pass = st.text_input("New Password", type="password")
+            confirm_pass = st.text_input("Confirm Password", type="password")
+
+            if st.button("Sign Up"):
+                users = load_users()
+                if new_pass != confirm_pass:
+                    st.error("❌ Passwords do not match.")
+                elif new_user in users:
+                    st.error("❌ Username already exists.")
+                elif len(new_pass) < 4:
+                    st.warning("⚠️ Password must be at least 4 characters.")
+                else:
+                    save_user(new_user, new_pass)
+                    st.success("✅ Account created! Please go to Login.")
+
+    # If Logged In -> Show User Info & Logout
     else:
+        st.success(f"👤 User: **{st.session_state['username']}**")
+        if st.button("Log out"):
+            st.session_state["is_logged_in"] = False
+            st.session_state["username"] = ""
+            st.session_state["is_pro"] = False
+            st.rerun()
+        st.divider()
+
+    st.header("🔑 Pro License Key")
+    if st.session_state.get("is_logged_in", False):
+        # --- License Key Section with Toggle ---
+        col1, col2 = st.columns([3, 1.5])  # Arrange input and toggle nicely
+
+        with col1:
+            # 1. The Input Field (Standard text input)
+            license_key = st.text_input("Pro License Key", key="license_input", placeholder="Enter key here")
+
+        with col2:
+            st.write("")  # Spacer
+            st.write("")  # Spacer
+            # 2. Toggle Button
+            show_key = st.checkbox("👁️ Show", value=False)
+
+        # 3. Conditional CSS Masking
+        # Only apply the "dots" style if the user wants to HIDE the key
+        if not show_key:
+            st.markdown("""
+            <style>
+                /* Hide text in the specific input field */
+                input[aria-label="Pro License Key"] {
+                    -webkit-text-security: disc !important;
+                    text-security: disc !important;
+                    font-family: text-security-disc !important;
+                }
+            </style>
+            """, unsafe_allow_html=True)
+
+        pro_password = st.secrets.get("PRO_PASSWORD", None)
+        if license_key and pro_password and license_key == pro_password:
+            st.session_state.is_pro = True
+            st.success("✅ Pro features unlocked!")
+        else:
+            st.session_state.is_pro = False
+            st.info("🔒 Advanced features are locked.")
+            st.link_button(
+                "🚀 Get Lifetime Access ($9)",
+                "https://scownu.gumroad.com/l/fdyrdb",
+            )
+    else:
+        st.info("🔒 **Pro Features are locked.** Please log in to enter a license key.")
         st.session_state.is_pro = False
-        st.info("🔒 Advanced features are locked.")
-        st.link_button(
-            "🚀 Get Lifetime Access ($9)",
-            "https://scownu.gumroad.com/l/fdyrdb",
-        )
 
 def _safe_getattr(msg, *attrs):
     """Safely get attribute from message with multiple fallback names."""
@@ -189,6 +272,134 @@ def generate_log_summary(file_path: str) -> str:
     return " | ".join(parts) if parts else "No summarizable data found in the log."
 
 
+def _format_duration(seconds_value):
+    if seconds_value is None:
+        return "N/A"
+    try:
+        total_seconds = int(round(float(seconds_value)))
+    except (TypeError, ValueError):
+        return "N/A"
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:d}h {minutes:02d}m {seconds:02d}s"
+    return f"{minutes:d}m {seconds:02d}s"
+
+
+def _safe_pdf_text(text):
+    return str(text).encode("latin-1", "replace").decode("latin-1")
+
+
+def build_report_summary(data, uploaded_file):
+    df_bat = data.get("df_bat")
+    df_vibe = data.get("df_vibe")
+    duration_seconds = None
+    if df_bat is not None and len(df_bat) > 0:
+        duration_seconds = float(df_bat["time_normalized"].max())
+    elif df_vibe is not None and len(df_vibe) > 0:
+        duration_seconds = float(df_vibe["time_normalized"].max())
+
+    max_current = None
+    max_voltage = None
+    if df_bat is not None and len(df_bat) > 0:
+        max_current = float(df_bat["curr"].max())
+        max_voltage = float(df_bat["volt"].max())
+
+    return {
+        "flight_duration": _format_duration(duration_seconds),
+        "max_altitude": "N/A",
+        "max_current": f"{max_current:.2f} A" if max_current is not None else "N/A",
+        "max_voltage": f"{max_voltage:.2f} V" if max_voltage is not None else "N/A",
+        "log_file_name": getattr(uploaded_file, "name", "Unknown"),
+    }
+
+
+def get_error_desc(err_type, err_msg):
+    full_text = f"{err_type} {err_msg}".upper()
+    translations = {
+        "CRASH": "💥 Crash Detected (Check motors/frame)",
+        "LOW_BATTERY": "🔋 Low Battery Warning (Land immediately)",
+        "BATTERY": "🔋 Battery Failsafe Triggered",
+        "EKF": "🧭 EKF Variance (GPS/Compass interference)",
+        "VIBE": "🫨 High Vibration Level (Check props/mounting)",
+        "RC": "📡 RC Failsafe (Signal Lost)",
+        "FAILSAFE": "⚠️ Failsafe Triggered (RTL or Land)",
+        "BARO": "☁️ Barometer Error (Altitude drift risk)",
+        "GPS": "🛰️ GPS Glitch or Loss",
+        "ARMING": "⚙️ Arming Check / Status",
+        "ERR": "❗ System Error",
+    }
+    for key, desc in translations.items():
+        if key in full_text:
+            return desc
+    return "ℹ️ Standard Event Log"
+
+
+def create_pdf_report(log_summary, ai_analysis, filename):
+    """
+    Generates a PDF report in English only.
+    Non-English characters are stripped out to prevent errors.
+    Returns: (bytes, error_message)
+    """
+    try:
+        # 1. Text Sanitizer (The Magic Fix)
+        def clean_text(text):
+            if not text:
+                return ""
+            # 1. Convert to string
+            text = str(text)
+            # 2. Remove Markdown symbols (*, #, `) that look messy in plain text
+            text = text.replace('*', '').replace('#', '').replace('`', '')
+            # 3. Force English (Latin-1), ignore non-English chars
+            return text.encode('latin-1', 'ignore').decode('latin-1')
+
+        pdf = FPDF()
+        pdf.add_page()
+
+        # Layout settings
+        margin = 10
+        pdf.set_left_margin(margin)
+        pdf.set_right_margin(margin)
+        epw = pdf.w - (margin * 2)
+
+        # 2. Header (English)
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(epw, 10, "Drone Log Analysis Report", ln=True, align='C')
+        pdf.ln(10)
+
+        # 3. Flight Overview (English)
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(epw, 10, "1. Flight Overview", ln=True)
+
+        pdf.set_font("Arial", "", 10)
+        for key, value in log_summary.items():
+            # Clean both key and value to ensure no Korean slips in
+            safe_line = f"{clean_text(key)}: {clean_text(str(value))}"
+            pdf.multi_cell(epw, 7, safe_line)
+
+        pdf.ln(5)
+
+        # 4. AI Diagnosis (English Content Only)
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(epw, 10, "2. AI Diagnosis Details", ln=True)
+
+        pdf.set_font("Arial", "", 10)
+        # If AI analysis was in Korean, this might become empty or just show English terms.
+        # This is expected behavior to avoid crashes/question marks.
+        pdf.multi_cell(epw, 7, clean_text(ai_analysis))
+
+        # 5. Footer
+        pdf.ln(20)
+        pdf.set_font("Arial", "I", 8)
+        pdf.cell(epw, 10, "Generated by AI Drone Log Analyzer", align='C')
+
+        # 6. Return Bytes (Streamlit compatible)
+        return bytes(pdf.output()), None
+
+    except Exception as e:
+        return None, str(e)
+
+
 def call_openai_api(messages, api_key):
     """
     Call OpenAI API with the conversation messages.
@@ -255,7 +466,7 @@ def analyze_log_file(file_bytes: bytes):
             message_count += 1
             msg_type = msg.get_type()
             message_types.add(msg_type)
-            
+
             if msg_type == "PARM":
                 has_parm = True
             elif msg_type == "MSG":
@@ -292,7 +503,7 @@ def analyze_log_file(file_bytes: bytes):
                         vibe_y = _safe_getattr(msg, 'VibeY', 'vibe_y', 'y')
                         vibe_z = _safe_getattr(msg, 'VibeZ', 'vibe_z', 'z')
                         timestamp = _safe_getattr(msg, 'time_usec', 'time_boot_ms') or vibe_count
-                        
+
                         if vibe_x is not None or vibe_y is not None or vibe_z is not None:
                             vibe_data.append({
                                 'time': timestamp,
@@ -315,7 +526,7 @@ def analyze_log_file(file_bytes: bytes):
                         volt = _safe_getattr(msg, 'Volt', 'volt', 'V')
                         curr = _safe_getattr(msg, 'Curr', 'curr', 'I')
                         timestamp = _safe_getattr(msg, 'time_usec', 'time_boot_ms') or bat_count
-                        
+
                         if volt is not None or curr is not None:
                             bat_data.append({
                                 'time': timestamp,
@@ -418,174 +629,197 @@ if uploaded_file is not None:
     elif message_count > 0:
         st.warning("No PARM or MSG records were found. The file may still be valid, but this is less common.")
     
-    # GPS track: draw flight path on a map using folium (Pro only)
-    st.write("---")
-    st.subheader("🗺️ Flight path (GPS)")
-    
-    if st.session_state.is_pro:
-        if len(gps_points) >= 2:
-            start_lat, start_lon = gps_points[0]
-            end_lat, end_lon = gps_points[-1]
-            
-            # Use Esri World Imagery (satellite) tiles and allow deep zoom
-            fmap = folium.Map(
-                location=[start_lat, start_lon],
-                zoom_start=16,
-                tiles=None,
-                max_zoom=20,
+    st.write("### 🔍 Flight Data Visualization")
+    tab_graphs, tab_map, tab_raw = st.tabs(
+        ["📊 Charts (Vibration/Power)", "🗺️ 3D Map", "📋 Raw Data"]
+    )
+
+    with tab_graphs:
+        st.write("#### 🔋 Battery & Power")
+        if df_bat is not None and len(df_bat) > 0:
+            fig, ax1 = plt.subplots(figsize=(12, 5))
+            ax2 = ax1.twinx()
+
+            # Voltage on left Y-axis
+            ax1.plot(
+                df_bat['time_normalized'],
+                df_bat['volt'],
+                color='tab:blue',
+                linewidth=0.7,
+                alpha=0.9,
+                label='Voltage (V)',
             )
-            folium.TileLayer(
-                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                attr="Esri World Imagery",
-                name="Esri World Imagery",
-                max_zoom=20,
-            ).add_to(fmap)
+            ax1.set_xlabel("Time (s)")
+            ax1.set_ylabel("Voltage (V)", color='tab:blue')
+            ax1.tick_params(axis='y', labelcolor='tab:blue')
 
-            # Draw flight path
-            folium.PolyLine(gps_points, color="red", weight=3, opacity=0.8).add_to(fmap)
-            folium.Marker(
-                location=[start_lat, start_lon],
-                tooltip="Start",
-                icon=folium.Icon(color="green", icon="play", prefix="fa"),
-            ).add_to(fmap)
-            folium.Marker(
-                location=[end_lat, end_lon],
-                tooltip="End",
-                icon=folium.Icon(color="red", icon="flag", prefix="fa"),
-            ).add_to(fmap)
+            # Current on right Y-axis
+            ax2.plot(
+                df_bat['time_normalized'],
+                df_bat['curr'],
+                color='tab:red',
+                linewidth=0.7,
+                alpha=0.9,
+                label='Current (A)',
+            )
+            ax2.set_ylabel("Current (A)", color='tab:red')
+            ax2.tick_params(axis='y', labelcolor='tab:red')
 
-            # Automatically fit map bounds to the whole flight path
-            fmap.fit_bounds(gps_points)
-            
-            st_folium(fmap, key="flight_map", width="100%", height=500)
+            ax1.grid(True, alpha=0.3)
+
+            # Combined legend
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+
+            plt.tight_layout()
+            st.pyplot(fig)
+
+            # Summary metrics
+            min_volt = float(df_bat['volt'].min())
+            max_curr = float(df_bat['curr'].max())
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Min Voltage (V)", f"{min_volt:.2f}")
+            with col2:
+                st.metric("Max Current (A)", f"{max_curr:.2f}")
         else:
-            st.info("No usable GPS track could be extracted from this log.")
-    else:
-        st.info("🔒 This feature is Pro-only.")
+            st.info("No BAT data available for charting.")
 
-    # Error & Event analysis (Pro only)
-    st.write("---")
-    st.subheader("🧯 Error & Event analysis")
-    if st.session_state.is_pro:
+        st.write("#### 🔍 Vibration")
+        if df_vibe is not None and len(df_vibe) > 0:
+            st.write(f"**VIBE messages collected:** {len(df_vibe):,}")
+
+            # Plot vibrations
+            fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+            fig.suptitle('Vibration Analysis', fontsize=16, fontweight='bold')
+
+            # X‑axis vibration
+            axes[0].plot(df_vibe['time_normalized'], df_vibe['x'], 'r-', linewidth=0.5, alpha=0.7)
+            axes[0].set_title('Vibration X', fontsize=12)
+            axes[0].set_ylabel('Value', fontsize=10)
+            axes[0].grid(True, alpha=0.3)
+
+            # Y‑axis vibration
+            axes[1].plot(df_vibe['time_normalized'], df_vibe['y'], 'g-', linewidth=0.5, alpha=0.7)
+            axes[1].set_title('Vibration Y', fontsize=12)
+            axes[1].set_ylabel('Value', fontsize=10)
+            axes[1].grid(True, alpha=0.3)
+
+            # Z‑axis vibration
+            axes[2].plot(df_vibe['time_normalized'], df_vibe['z'], 'b-', linewidth=0.5, alpha=0.7)
+            axes[2].set_title('Vibration Z', fontsize=12)
+            axes[2].set_xlabel('Time (s)', fontsize=10)
+            axes[2].set_ylabel('Value', fontsize=10)
+            axes[2].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            st.pyplot(fig)
+
+            # Summary statistics
+            col1, col2, col3 = st.columns(3)
+            for i, axis in enumerate(['x', 'y', 'z']):
+                with [col1, col2, col3][i]:
+                    st.metric(f"{axis.upper()} mean", f"{df_vibe[axis].mean():.2f}")
+                    st.metric(f"{axis.upper()} max", f"{df_vibe[axis].max():.2f}")
+                    st.metric(f"{axis.upper()} min", f"{df_vibe[axis].min():.2f}")
+        elif 'VIBE' in message_types:
+            st.warning("VIBE messages were detected, but no usable vibration data could be extracted.")
+        else:
+            st.info("No VIBE data available for charting.")
+
+    with tab_map:
+        st.write("#### 🗺️ 3D Flight Path (Google Hybrid)")
+
+        map_data = pd.DataFrame(gps_points, columns=["lat", "lon"])
+        if not map_data.empty and "lat" in map_data.columns and "lon" in map_data.columns:
+            # 1. OPTIMIZATION: Downsample to prevent crash
+            display_data = map_data
+            if len(map_data) > 500:
+                display_data = map_data.iloc[::10, :]
+                st.caption(f"ℹ️ Map optimized: Displaying {len(display_data)} points.")
+
+            # 2. AUTO-CENTER
+            mid_lat = display_data["lat"].mean()
+            mid_lon = display_data["lon"].mean()
+
+            view_state = pdk.ViewState(
+                latitude=mid_lat,
+                longitude=mid_lon,
+                zoom=17,
+                pitch=45,
+                bearing=0,
+            )
+
+            # 3. BACKGROUND: Google Hybrid (Satellite + Roads)
+            google_hybrid_layer = pdk.Layer(
+                "TileLayer",
+                data=["https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}"],
+                get_line_color=[0, 0, 0],
+                max_zoom=20,
+                opacity=1.0,
+            )
+
+            # 4. DATA: Red Flight Path (Scatterplot)
+            path_layer = pdk.Layer(
+                "ScatterplotLayer",
+                display_data,
+                get_position=["lon", "lat"],
+                get_color=[255, 0, 0, 200],
+                get_radius=2,
+                pickable=True,
+            )
+
+            # 5. RENDER
+            st.pydeck_chart(pdk.Deck(
+                map_style=None,
+                initial_view_state=view_state,
+                layers=[google_hybrid_layer, path_layer],
+                tooltip={"text": "Lat: {lat}\nLon: {lon}"},
+            ))
+        else:
+            st.warning("⚠️ No GPS data found in this log.")
+
+    with tab_raw:
+        st.write("#### 🧯 Error & Event analysis")
         if err_messages or ev_messages:
             rows = []
             for msg in err_messages:
-                rows.append({"Type": "ERR", "Message": msg})
+                rows.append({
+                    "Time": "N/A",
+                    "Type": "ERR",
+                    "Message": msg,
+                    "💡 Explanation": get_error_desc("ERR", msg),
+                })
             for msg in ev_messages:
-                rows.append({"Type": "EV", "Message": msg})
+                rows.append({
+                    "Time": "N/A",
+                    "Type": "EV",
+                    "Message": msg,
+                    "💡 Explanation": get_error_desc("EV", msg),
+                })
             df_errors = pd.DataFrame(rows)
-            st.dataframe(df_errors, use_container_width=True)
+            st.dataframe(
+                df_errors[["Time", "Type", "Message", "💡 Explanation"]],
+                use_container_width=True,
+            )
         else:
             st.info("No ERR/EV records found in this log.")
-    else:
-        st.info("🔒 This feature is Pro-only.")
-
-    # Battery analysis (BAT)
-    if df_bat is not None and len(df_bat) > 0:
-        st.write("---")
-        st.subheader("🔋 Battery analysis (BAT)")
-
-        fig, ax1 = plt.subplots(figsize=(12, 5))
-        ax2 = ax1.twinx()
-
-        # Voltage on left Y-axis
-        ax1.plot(
-            df_bat['time_normalized'],
-            df_bat['volt'],
-            color='tab:blue',
-            linewidth=0.7,
-            alpha=0.9,
-            label='Voltage (V)',
-        )
-        ax1.set_xlabel("Time (s)")
-        ax1.set_ylabel("Voltage (V)", color='tab:blue')
-        ax1.tick_params(axis='y', labelcolor='tab:blue')
-
-        # Current on right Y-axis
-        ax2.plot(
-            df_bat['time_normalized'],
-            df_bat['curr'],
-            color='tab:red',
-            linewidth=0.7,
-            alpha=0.9,
-            label='Current (A)',
-        )
-        ax2.set_ylabel("Current (A)", color='tab:red')
-        ax2.tick_params(axis='y', labelcolor='tab:red')
-
-        ax1.grid(True, alpha=0.3)
-
-        # Combined legend
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
-
-        plt.tight_layout()
-        st.pyplot(fig)
-
-        # Summary metrics
-        min_volt = float(df_bat['volt'].min())
-        max_curr = float(df_bat['curr'].max())
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Min Voltage (V)", f"{min_volt:.2f}")
-        with col2:
-            st.metric("Max Current (A)", f"{max_curr:.2f}")
-    
-    # VIBE vibration analysis
-    if df_vibe is not None and len(df_vibe) > 0:
-        st.write("---")
-        st.write("**🔍 Vibration analysis (VIBE messages)**")
-        st.write(f"**VIBE messages collected:** {len(df_vibe):,}")
-        
-        # Plot vibrations
-        fig, axes = plt.subplots(3, 1, figsize=(12, 10))
-        fig.suptitle('Vibration Analysis', fontsize=16, fontweight='bold')
-        
-        # X‑axis vibration
-        axes[0].plot(df_vibe['time_normalized'], df_vibe['x'], 'r-', linewidth=0.5, alpha=0.7)
-        axes[0].set_title('Vibration X', fontsize=12)
-        axes[0].set_ylabel('Value', fontsize=10)
-        axes[0].grid(True, alpha=0.3)
-        
-        # Y‑axis vibration
-        axes[1].plot(df_vibe['time_normalized'], df_vibe['y'], 'g-', linewidth=0.5, alpha=0.7)
-        axes[1].set_title('Vibration Y', fontsize=12)
-        axes[1].set_ylabel('Value', fontsize=10)
-        axes[1].grid(True, alpha=0.3)
-        
-        # Z‑axis vibration
-        axes[2].plot(df_vibe['time_normalized'], df_vibe['z'], 'b-', linewidth=0.5, alpha=0.7)
-        axes[2].set_title('Vibration Z', fontsize=12)
-        axes[2].set_xlabel('Time (s)', fontsize=10)
-        axes[2].set_ylabel('Value', fontsize=10)
-        axes[2].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        st.pyplot(fig)
-        
-        # Summary statistics
-        col1, col2, col3 = st.columns(3)
-        for i, axis in enumerate(['x', 'y', 'z']):
-            with [col1, col2, col3][i]:
-                st.metric(f"{axis.upper()} mean", f"{df_vibe[axis].mean():.2f}")
-                st.metric(f"{axis.upper()} max", f"{df_vibe[axis].max():.2f}")
-                st.metric(f"{axis.upper()} min", f"{df_vibe[axis].min():.2f}")
-    elif 'VIBE' in message_types:
-        st.write("---")
-        st.write("**🔍 Vibration analysis (VIBE messages)**")
-        st.warning("VIBE messages were detected, but no usable vibration data could be extracted.")
     
     # Store analyzed data in session state for chatbot access
     st.session_state.analyzed_data = data
 
-# AI Chatbot section (Pro only)
+# AI Comprehensive Diagnosis (Pro only)
 st.write("---")
-st.subheader("🤖 AI Drone Consultation Chatbot")
+st.subheader("🤖 AI Comprehensive Diagnosis")
+
+log_summary = ""
+if "analyzed_data" in st.session_state:
+    log_summary = st.session_state.analyzed_data.get("log_summary", "")
 
 if not st.session_state.is_pro:
-    st.info("🔒 This feature is Pro-only.")
+    st.info("🔒 **AI Diagnosis is a Pro Feature.** Enter a license key to see the detailed AI analysis and download reports.")
 else:
     # Initialize chat history in session state
     if "messages" not in st.session_state:
@@ -596,9 +830,8 @@ else:
         st.error("Please contact the administrator (API key configuration error).")
     else:
         # Generate log summary for context injection (if data exists)
-        if "analyzed_data" in st.session_state:
-            log_summary = st.session_state.analyzed_data.get("log_summary", "")
-            system_prompt = f"""You are a world-class Ardupilot Log Analysis Expert with 25+ years of experience in autonomous flight systems, MAVLink protocol analysis, and drone diagnostics. You specialize in identifying flight anomalies, diagnosing hardware issues, and providing actionable maintenance recommendations.
+        if log_summary:
+            system_prompt = f"""You are a world-class Ardupilot Log Analysis Expert with 25+ years of experience in autonomous flight systems, MAVLink protocol analysis, and drone diagnostics. You specialize in identifying flight anomalies, diagnosing hardware issues, and providing actionable maintenance recommendations. You must respond ONLY in English. Do not use Korean.
 
 **Your Expertise Includes:**
 - Deep understanding of Ardupilot firmware, flight modes, and control algorithms
@@ -628,7 +861,7 @@ else:
 
 Answer the user's questions based on this flight log summary. For questions beyond the log data, provide expert guidance on drone operations, maintenance protocols, and industry best practices while clearly distinguishing between log-based analysis and general recommendations."""
         else:
-            system_prompt = """You are a world-class Ardupilot Log Analysis Expert with 25+ years of experience in autonomous flight systems, MAVLink protocol analysis, and drone diagnostics.
+            system_prompt = """You are a world-class Ardupilot Log Analysis Expert with 25+ years of experience in autonomous flight systems, MAVLink protocol analysis, and drone diagnostics. You must respond ONLY in English. Do not use Korean.
 
 **Your Expertise Includes:**
 - Deep understanding of Ardupilot firmware, flight modes, and control algorithms
@@ -660,12 +893,30 @@ Provide comprehensive guidance on:
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
+                if (
+                    st.session_state.get("is_pro")
+                    and message["role"] == "assistant"
+                    and st.session_state.get("last_ai_response") == message["content"]
+                    and "analyzed_data" in st.session_state
+                ):
+                    summary = build_report_summary(st.session_state.analyzed_data, uploaded_file)
+                    analysis_result = message["content"]
+                    pdf_data, error_msg = create_pdf_report(summary, analysis_result, uploaded_file.name)
+                    if pdf_data:
+                        st.download_button(
+                            label="📄 Download Report (PDF)",
+                            data=pdf_data,
+                            file_name="drone_report.pdf",
+                            mime="application/pdf"
+                        )
+                    elif error_msg:
+                        st.error(f"❌ PDF Creation Failed: {error_msg}")
         
         # Chat input
         if prompt := st.chat_input("Ask me about your drone log data..."):
             # Add user message to chat history
             st.session_state.messages.append({"role": "user", "content": prompt})
-            
+    
             # Display user message
             with st.chat_message("user"):
                 st.markdown(prompt)
@@ -680,6 +931,31 @@ Provide comprehensive guidance on:
                 with st.spinner("Thinking..."):
                     response = call_openai_api(api_messages, api_key)
                     st.markdown(response)
+                st.session_state.last_ai_response = response
+                # --- DEBUG & PDF SECTION ---
+                if 'response' in locals() and response:
+                    st.write("🔍 Debug: AI Analysis found. Checking Pro Mode...")
+
+                    if st.session_state.get('is_pro'):
+                        st.write("🔍 Debug: Pro Mode is ACTIVE. Attempting PDF generation...")
+
+                        summary = build_report_summary(st.session_state.analyzed_data, uploaded_file)
+                        pdf_data, error_msg = create_pdf_report(summary, response, uploaded_file.name)
+
+                        if pdf_data:
+                            st.success("✅ Debug: PDF Data created successfully!")
+                            st.download_button(
+                                label="📄 Download Report (PDF)",
+                                data=pdf_data,
+                                file_name="drone_report.pdf",
+                                mime="application/pdf"
+                            )
+                        else:
+                            st.error(f"❌ PDF Generation Failed: {error_msg}")
+                    else:
+                        st.warning("⚠️ Debug: Pro Mode is NOT active. (Password needed)")
+                else:
+                    st.error("❌ Debug: No AI response variable found.")
             
             # Add assistant response to chat history
             st.session_state.messages.append({"role": "assistant", "content": response})
