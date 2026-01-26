@@ -949,7 +949,8 @@ Provide comprehensive guidance on:
                                 label="📄 Download Report (PDF)",
                                 data=pdf_data,
                                 file_name="drone_report.pdf",
-                                mime="application/pdf"
+                                mime="application/pdf",
+                                key="pdf_download_current",
                             )
                         else:
                             st.error(f"❌ PDF Generation Failed: {error_msg}")
