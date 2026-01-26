@@ -176,6 +176,22 @@ def _safe_getattr(msg, *attrs):
             return val
     return None
 
+def _extract_time_us(msg):
+    """Extract timestamp in microseconds from a log message."""
+    time_us = _safe_getattr(msg, "TimeUS", "time_us", "time_usec", "timeUS")
+    if time_us is not None:
+        try:
+            return float(time_us)
+        except (TypeError, ValueError):
+            return None
+    time_ms = _safe_getattr(msg, "time_boot_ms", "TimeMS", "time_ms")
+    if time_ms is not None:
+        try:
+            return float(time_ms) * 1000.0
+        except (TypeError, ValueError):
+            return None
+    return None
+
 def generate_log_summary(file_path: str) -> str:
     """Parse the log with pymavlink and return a concise summary string for AI context injection."""
     att_roll_errors = []
@@ -293,11 +309,12 @@ def _safe_pdf_text(text):
 def build_report_summary(data, uploaded_file):
     df_bat = data.get("df_bat")
     df_vibe = data.get("df_vibe")
-    duration_seconds = None
-    if df_bat is not None and len(df_bat) > 0:
-        duration_seconds = float(df_bat["time_normalized"].max())
-    elif df_vibe is not None and len(df_vibe) > 0:
-        duration_seconds = float(df_vibe["time_normalized"].max())
+    duration_seconds = data.get("duration_seconds")
+    if duration_seconds is None:
+        if df_bat is not None and len(df_bat) > 0:
+            duration_seconds = float(df_bat["TimeS"].max()) if "TimeS" in df_bat.columns else float(df_bat["time_normalized"].max())
+        elif df_vibe is not None and len(df_vibe) > 0:
+            duration_seconds = float(df_vibe["TimeS"].max()) if "TimeS" in df_vibe.columns else float(df_vibe["time_normalized"].max())
 
     max_current = None
     max_voltage = None
@@ -333,6 +350,88 @@ def get_error_desc(err_type, err_msg):
         if key in full_text:
             return desc
     return "ℹ️ Standard Event Log"
+
+
+def build_detailed_stats_string(data):
+    df_bat = data.get("df_bat")
+    df_vibe = data.get("df_vibe")
+    err_messages = data.get("err_messages", [])
+
+    # Flight time (minutes)
+    flight_minutes = "N/A"
+    duration_seconds = data.get("duration_seconds")
+    if duration_seconds is not None:
+        try:
+            flight_minutes = f"{(float(duration_seconds) / 60):.2f} min"
+        except (TypeError, ValueError):
+            flight_minutes = "N/A"
+    elif df_bat is not None and len(df_bat) > 0:
+        time_max = df_bat["TimeS"].max() if "TimeS" in df_bat.columns else df_bat["time_normalized"].max()
+        flight_minutes = f"{(time_max / 60):.2f} min"
+    elif df_vibe is not None and len(df_vibe) > 0:
+        time_max = df_vibe["TimeS"].max() if "TimeS" in df_vibe.columns else df_vibe["time_normalized"].max()
+        flight_minutes = f"{(time_max / 60):.2f} min"
+
+    # Battery health
+    start_v = end_v = min_v = total_ah = "N/A"
+    if df_bat is not None and len(df_bat) > 0:
+        start_v = f"{float(df_bat['volt'].iloc[0]):.2f} V"
+        end_v = f"{float(df_bat['volt'].iloc[-1]):.2f} V"
+        min_v = f"{float(df_bat['volt'].min()):.2f} V"
+        if "TimeS" in df_bat.columns:
+            dt = df_bat["TimeS"].diff().fillna(0).clip(lower=0)
+        elif "time_normalized" in df_bat.columns:
+            dt = df_bat["time_normalized"].diff().fillna(0).clip(lower=0)
+            total_ah_val = float((df_bat["curr"] * dt).sum() / 3600)
+            total_ah = f"{total_ah_val:.3f} Ah"
+
+    # Vibration analysis
+    vibe_stats = "N/A"
+    if df_vibe is not None and len(df_vibe) > 0:
+        vx_mean = df_vibe["x"].mean()
+        vy_mean = df_vibe["y"].mean()
+        vz_mean = df_vibe["z"].mean()
+        vx_max = df_vibe["x"].max()
+        vy_max = df_vibe["y"].max()
+        vz_max = df_vibe["z"].max()
+        clipping = any(val > 30 for val in [vx_max, vy_max, vz_max])
+        vibe_stats = (
+            f"VibeX mean/max: {vx_mean:.2f}/{vx_max:.2f}, "
+            f"VibeY mean/max: {vy_mean:.2f}/{vy_max:.2f}, "
+            f"VibeZ mean/max: {vz_mean:.2f}/{vz_max:.2f}, "
+            f"Clipping: {'YES' if clipping else 'NO'}"
+        )
+
+    # Motor balance (PWM)
+    motor_balance = "N/A (PWM data not available)"
+
+    # GPS health
+    gps_health = "N/A (HDOP/Sat count not available)"
+
+    # Errors
+    if err_messages:
+        errors_text = "\n".join([f"- {msg}" for msg in err_messages])
+    else:
+        errors_text = "None"
+
+    detailed_stats = f"""
+Flight Time: {flight_minutes}
+Battery Health:
+  - Start Voltage: {start_v}
+  - End Voltage: {end_v}
+  - Voltage Sag (Min): {min_v}
+  - Total Current Consumed: {total_ah}
+Vibration Analysis:
+  - {vibe_stats}
+Motor Balance:
+  - {motor_balance}
+GPS Health:
+  - {gps_health}
+Errors:
+{errors_text}
+""".strip()
+
+    return detailed_stats
 
 
 def create_pdf_report(log_summary, ai_analysis, filename):
@@ -440,6 +539,29 @@ def _extract_gps_coords(msg):
         return (lat, lon)
     return None
 
+def _calculate_arm_duration(arm_events, fallback_end_us=None):
+    """Calculate total armed duration in seconds from EV arm/disarm events."""
+    if not arm_events:
+        return None
+    events_sorted = sorted(arm_events, key=lambda item: item[0])
+    total_us = 0.0
+    arm_start = None
+    for time_us, ev_value in events_sorted:
+        if ev_value == 10:
+            if arm_start is None:
+                arm_start = time_us
+        elif ev_value == 11:
+            if arm_start is not None and time_us >= arm_start:
+                total_us += time_us - arm_start
+                arm_start = None
+    if arm_start is not None:
+        end_us = fallback_end_us if fallback_end_us is not None else events_sorted[-1][0]
+        if end_us >= arm_start:
+            total_us += end_us - arm_start
+    if total_us <= 0:
+        return None
+    return total_us / 1e6
+
 @st.cache_data(show_spinner=False)
 def analyze_log_file(file_bytes: bytes):
     """Parse the log file once and cache results."""
@@ -461,6 +583,9 @@ def analyze_log_file(file_bytes: bytes):
         has_msg = False
         err_messages = []
         ev_messages = []
+        arm_events = []
+        gps_time_us = []
+        parm_time_us = []
         
         for msg in _parse_message_stream(master):
             message_count += 1
@@ -469,14 +594,44 @@ def analyze_log_file(file_bytes: bytes):
 
             if msg_type == "PARM":
                 has_parm = True
+                parm_time = _extract_time_us(msg)
+                if parm_time is not None:
+                    parm_time_us.append(parm_time)
             elif msg_type == "MSG":
                 has_msg = True
             elif msg_type == "ERR" and len(err_messages) < 50:
                 err_messages.append(str(msg))
             elif msg_type == "EV" and len(ev_messages) < 50:
                 ev_messages.append(str(msg))
+                ev_value = _safe_getattr(msg, "Id", "id", "Event", "event", "EV", "E", "Value", "value")
+                ev_time = _extract_time_us(msg)
+                try:
+                    ev_value_int = int(ev_value) if ev_value is not None else None
+                except (TypeError, ValueError):
+                    ev_value_int = None
+                if ev_value_int in (10, 11) and ev_time is not None:
+                    arm_events.append((ev_time, ev_value_int))
+            elif msg_type in GPS_MESSAGE_TYPES:
+                gps_time = _extract_time_us(msg)
+                if gps_time is not None:
+                    gps_time_us.append(gps_time)
         
         master.close()
+
+        duration_sec = 0
+        fallback_end_us = None
+        if gps_time_us:
+            fallback_end_us = max(gps_time_us)
+        elif parm_time_us:
+            fallback_end_us = max(parm_time_us)
+
+        arm_duration = _calculate_arm_duration(arm_events, fallback_end_us=fallback_end_us)
+        if arm_duration is not None:
+            duration_sec = arm_duration
+        elif gps_time_us:
+            duration_sec = (max(gps_time_us) - min(gps_time_us)) / 1e6
+        elif parm_time_us:
+            duration_sec = (max(parm_time_us) - min(parm_time_us)) / 1e6
         
         # Second pass: GPS track
         gps_points = []
@@ -502,11 +657,13 @@ def analyze_log_file(file_bytes: bytes):
                         vibe_x = _safe_getattr(msg, 'VibeX', 'vibe_x', 'x')
                         vibe_y = _safe_getattr(msg, 'VibeY', 'vibe_y', 'y')
                         vibe_z = _safe_getattr(msg, 'VibeZ', 'vibe_z', 'z')
-                        timestamp = _safe_getattr(msg, 'time_usec', 'time_boot_ms') or vibe_count
+                        timestamp_us = _extract_time_us(msg)
+                        if timestamp_us is None:
+                            timestamp_us = float(vibe_count) * 1e6
 
                         if vibe_x is not None or vibe_y is not None or vibe_z is not None:
                             vibe_data.append({
-                                'time': timestamp,
+                                'TimeUS': timestamp_us,
                                 'x': float(vibe_x) if vibe_x is not None else 0,
                                 'y': float(vibe_y) if vibe_y is not None else 0,
                                 'z': float(vibe_z) if vibe_z is not None else 0
@@ -525,11 +682,13 @@ def analyze_log_file(file_bytes: bytes):
                         bat_count += 1
                         volt = _safe_getattr(msg, 'Volt', 'volt', 'V')
                         curr = _safe_getattr(msg, 'Curr', 'curr', 'I')
-                        timestamp = _safe_getattr(msg, 'time_usec', 'time_boot_ms') or bat_count
+                        timestamp_us = _extract_time_us(msg)
+                        if timestamp_us is None:
+                            timestamp_us = float(bat_count) * 1e6
 
                         if volt is not None or curr is not None:
                             bat_data.append({
-                                'time': timestamp,
+                                'TimeUS': timestamp_us,
                                 'volt': float(volt) if volt is not None else 0.0,
                                 'curr': float(curr) if curr is not None else 0.0,
                             })
@@ -540,14 +699,22 @@ def analyze_log_file(file_bytes: bytes):
         df_vibe = None
         if vibe_data:
             df_vibe = pd.DataFrame(vibe_data)
-            time_col = df_vibe['time']
-            df_vibe['time_normalized'] = (time_col - time_col.min()) / 1000000 if 'time' in df_vibe.columns else range(len(df_vibe))
+            if 'TimeUS' in df_vibe.columns:
+                df_vibe['TimeS'] = (df_vibe['TimeUS'] - df_vibe['TimeUS'].min()) / 1e6
+                df_vibe['time_normalized'] = df_vibe['TimeS']
+            else:
+                df_vibe['TimeS'] = range(len(df_vibe))
+                df_vibe['time_normalized'] = df_vibe['TimeS']
 
         df_bat = None
         if bat_data:
             df_bat = pd.DataFrame(bat_data)
-            time_col = df_bat['time']
-            df_bat['time_normalized'] = (time_col - time_col.min()) / 1000000 if 'time' in df_bat.columns else range(len(df_bat))
+            if 'TimeUS' in df_bat.columns:
+                df_bat['TimeS'] = (df_bat['TimeUS'] - df_bat['TimeUS'].min()) / 1e6
+                df_bat['time_normalized'] = df_bat['TimeS']
+            else:
+                df_bat['TimeS'] = range(len(df_bat))
+                df_bat['time_normalized'] = df_bat['TimeS']
         
         return {
             'file_size': file_size,
@@ -559,6 +726,7 @@ def analyze_log_file(file_bytes: bytes):
             'gps_points': gps_points,
             'df_vibe': df_vibe,
             'df_bat': df_bat,
+            'duration_seconds': duration_sec,
             'log_summary': generate_log_summary(file_path),
             'err_messages': err_messages,
             'ev_messages': ev_messages,
@@ -642,20 +810,20 @@ if uploaded_file is not None:
 
             # Voltage on left Y-axis
             ax1.plot(
-                df_bat['time_normalized'],
+                df_bat['TimeS'],
                 df_bat['volt'],
                 color='tab:blue',
                 linewidth=0.7,
                 alpha=0.9,
                 label='Voltage (V)',
             )
-            ax1.set_xlabel("Time (s)")
+            ax1.set_xlabel("Time (seconds)")
             ax1.set_ylabel("Voltage (V)", color='tab:blue')
             ax1.tick_params(axis='y', labelcolor='tab:blue')
 
             # Current on right Y-axis
             ax2.plot(
-                df_bat['time_normalized'],
+                df_bat['TimeS'],
                 df_bat['curr'],
                 color='tab:red',
                 linewidth=0.7,
@@ -696,21 +864,21 @@ if uploaded_file is not None:
             fig.suptitle('Vibration Analysis', fontsize=16, fontweight='bold')
 
             # X‑axis vibration
-            axes[0].plot(df_vibe['time_normalized'], df_vibe['x'], 'r-', linewidth=0.5, alpha=0.7)
+            axes[0].plot(df_vibe['TimeS'], df_vibe['x'], 'r-', linewidth=0.5, alpha=0.7)
             axes[0].set_title('Vibration X', fontsize=12)
             axes[0].set_ylabel('Value', fontsize=10)
             axes[0].grid(True, alpha=0.3)
 
             # Y‑axis vibration
-            axes[1].plot(df_vibe['time_normalized'], df_vibe['y'], 'g-', linewidth=0.5, alpha=0.7)
+            axes[1].plot(df_vibe['TimeS'], df_vibe['y'], 'g-', linewidth=0.5, alpha=0.7)
             axes[1].set_title('Vibration Y', fontsize=12)
             axes[1].set_ylabel('Value', fontsize=10)
             axes[1].grid(True, alpha=0.3)
 
             # Z‑axis vibration
-            axes[2].plot(df_vibe['time_normalized'], df_vibe['z'], 'b-', linewidth=0.5, alpha=0.7)
+            axes[2].plot(df_vibe['TimeS'], df_vibe['z'], 'b-', linewidth=0.5, alpha=0.7)
             axes[2].set_title('Vibration Z', fontsize=12)
-            axes[2].set_xlabel('Time (s)', fontsize=10)
+            axes[2].set_xlabel('Time (seconds)', fontsize=10)
             axes[2].set_ylabel('Value', fontsize=10)
             axes[2].grid(True, alpha=0.3)
 
@@ -814,10 +982,6 @@ if uploaded_file is not None:
 st.write("---")
 st.subheader("🤖 AI Comprehensive Diagnosis")
 
-log_summary = ""
-if "analyzed_data" in st.session_state:
-    log_summary = st.session_state.analyzed_data.get("log_summary", "")
-
 if not st.session_state.is_pro:
     st.info("🔒 **AI Diagnosis is a Pro Feature.** Enter a license key to see the detailed AI analysis and download reports.")
 else:
@@ -829,65 +993,9 @@ else:
     if not api_key:
         st.error("Please contact the administrator (API key configuration error).")
     else:
-        # Generate log summary for context injection (if data exists)
-        if log_summary:
-            system_prompt = f"""You are a world-class Ardupilot Log Analysis Expert with 25+ years of experience in autonomous flight systems, MAVLink protocol analysis, and drone diagnostics. You specialize in identifying flight anomalies, diagnosing hardware issues, and providing actionable maintenance recommendations. You must respond ONLY in English. Do not use Korean.
-
-**Your Expertise Includes:**
-- Deep understanding of Ardupilot firmware, flight modes, and control algorithms
-- Comprehensive knowledge of MAVLink message types (ATT, GPS, VIBE, BAT, CTUN, ERR, EV, etc.)
-- Advanced interpretation of telemetry data, sensor readings, and flight dynamics
-- Root cause analysis of vibration patterns, GPS issues, battery degradation, and attitude control problems
-- Industry best practices for drone maintenance, calibration, and troubleshooting
-
-**Analysis Framework:**
-1. **Data Interpretation**: Analyze all provided metrics (ATT errors, GPS quality, vibration levels, battery health, throttle outputs) in context
-2. **Pattern Recognition**: Identify correlations between different message types and flight phases
-3. **Anomaly Detection**: Flag unusual patterns, outliers, or concerning trends that may indicate issues
-4. **Root Cause Analysis**: Trace symptoms back to potential hardware/software/firmware causes
-5. **Actionable Recommendations**: Provide specific, prioritized steps for investigation and resolution
-
-**Flight Log Summary:**
-{log_summary}
-
-**Your Response Style:**
-- Answer in English only
-- Be professional, thorough, and technically precise
-- Use clear structure: Observation → Analysis → Recommendation
-- Quantify issues when possible (e.g., "VIBE X-axis shows 15% above normal threshold")
-- Prioritize safety-critical issues first
-- If data is insufficient, clearly state assumptions and recommend additional diagnostics
-- Reference specific message types and values from the log when relevant
-
-Answer the user's questions based on this flight log summary. For questions beyond the log data, provide expert guidance on drone operations, maintenance protocols, and industry best practices while clearly distinguishing between log-based analysis and general recommendations."""
-        else:
-            system_prompt = """You are a world-class Ardupilot Log Analysis Expert with 25+ years of experience in autonomous flight systems, MAVLink protocol analysis, and drone diagnostics. You must respond ONLY in English. Do not use Korean.
-
-**Your Expertise Includes:**
-- Deep understanding of Ardupilot firmware, flight modes, and control algorithms
-- Comprehensive knowledge of MAVLink message types and their significance
-- Advanced interpretation of telemetry data, sensor readings, and flight dynamics
-- Root cause analysis of common drone issues
-- Industry best practices for drone maintenance, calibration, and troubleshooting
-
-**When No Log is Available:**
-Provide comprehensive guidance on:
-1. **Log Analysis Fundamentals**: How to interpret key message types (ATT, GPS, VIBE, BAT, CTUN, ERR, EV)
-2. **Common Anomalies**: Typical issues seen in logs (GPS glitches, vibration problems, battery degradation, attitude control errors)
-3. **Metric Interpretation**: 
-   - Vibration thresholds and what high values indicate
-   - Battery voltage/current patterns and health indicators
-   - GPS quality metrics (NSats, HDOP) and their impact on flight safety
-   - Attitude control errors and their relationship to flight stability
-4. **Maintenance Best Practices**: Calibration procedures, preventive maintenance schedules, and diagnostic workflows
-5. **Troubleshooting Workflows**: Systematic approaches to identifying and resolving issues
-
-**Your Response Style:**
-- Answer in English only
-- Be professional, thorough, and technically precise
-- Use clear structure and examples
-- Reference industry standards and best practices
-- Provide actionable guidance that users can implement"""
+        detailed_stats_string = ""
+        if "analyzed_data" in st.session_state:
+            detailed_stats_string = build_detailed_stats_string(st.session_state.analyzed_data)
 
         # Display chat history
         for i, message in enumerate(st.session_state.messages):
@@ -912,53 +1020,63 @@ Provide comprehensive guidance on:
                         )
                     elif error_msg:
                         st.error(f"❌ PDF Creation Failed: {error_msg}")
-        
+
         # Chat input
         if prompt := st.chat_input("Ask me about your drone log data..."):
             # Add user message to chat history
             st.session_state.messages.append({"role": "user", "content": prompt})
-    
+
             # Display user message
             with st.chat_message("user"):
                 st.markdown(prompt)
-            
-            # Prepare messages for API call (system + conversation history)
-            api_messages = [{"role": "system", "content": system_prompt}]
-            api_messages.extend({"role": msg["role"], "content": msg["content"]} 
-                               for msg in st.session_state.messages[-10:])
-            
+
+            prompt_text = f"""
+Role: You are a Senior ArduPilot Log Analysis Engineer.
+Task: Analyze the provided flight log data and answer the user's question with high technical accuracy.
+
+[Detailed Flight Data]
+{detailed_stats_string}
+
+[User Question]
+{prompt}
+
+[Instructions]
+1. **Language Rule:** ALWAYS answer in the SAME language as the [User Question].
+   - If the user asks in Korean, answer in Korean.
+   - If the user asks in English, answer in English.
+   - Do NOT mix languages unless necessary for technical terms.
+2. Analyze Vibration: If Z-vibe > 15, warn about damping.
+3. Analyze Power: Check for voltage sag (V_min < 3.3V/cell).
+4. Analyze Motor Balance: Check PWM spread.
+5. Provide actionable tuning advice based on the specific values above.
+"""
+
+            api_messages = [
+                {"role": "system", "content": "Follow the language rule in the prompt."},
+                {"role": "user", "content": prompt_text},
+            ]
+
             # Get AI response
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
                     response = call_openai_api(api_messages, api_key)
                     st.markdown(response)
                 st.session_state.last_ai_response = response
-                # --- DEBUG & PDF SECTION ---
-                if 'response' in locals() and response:
-                    st.write("🔍 Debug: AI Analysis found. Checking Pro Mode...")
 
-                    if st.session_state.get('is_pro'):
-                        st.write("🔍 Debug: Pro Mode is ACTIVE. Attempting PDF generation...")
+                if response:
+                    summary = build_report_summary(st.session_state.analyzed_data, uploaded_file)
+                    pdf_data, error_msg = create_pdf_report(summary, response, uploaded_file.name)
+                    if pdf_data:
+                        st.download_button(
+                            label="📄 Download Report (PDF)",
+                            data=pdf_data,
+                            file_name="drone_report.pdf",
+                            mime="application/pdf",
+                            key="pdf_download_current",
+                        )
+                    elif error_msg:
+                        st.error(f"❌ PDF Generation Failed: {error_msg}")
 
-                        summary = build_report_summary(st.session_state.analyzed_data, uploaded_file)
-                        pdf_data, error_msg = create_pdf_report(summary, response, uploaded_file.name)
-
-                        if pdf_data:
-                            st.success("✅ Debug: PDF Data created successfully!")
-                            st.download_button(
-                                label="📄 Download Report (PDF)",
-                                data=pdf_data,
-                                file_name="drone_report.pdf",
-                                mime="application/pdf",
-                                key="pdf_download_current",
-                            )
-                        else:
-                            st.error(f"❌ PDF Generation Failed: {error_msg}")
-                    else:
-                        st.warning("⚠️ Debug: Pro Mode is NOT active. (Password needed)")
-                else:
-                    st.error("❌ Debug: No AI response variable found.")
-            
             # Add assistant response to chat history
             st.session_state.messages.append({"role": "assistant", "content": response})
         
