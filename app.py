@@ -53,6 +53,10 @@ hide_st_style = """
     [data-testid="stStatusWidget"] {display: none !important;}
     [data-testid="stToolbar"] {display: none !important;}
     [data-testid="stDeployButton"] {display: none !important;}
+    [data-testid="stActionButton"] {display: none !important;}
+    [data-testid="stToolbarActionButton"] {display: none !important;}
+    [data-testid="stFloatingActionButton"] {display: none !important;}
+    [data-testid="stAppLauncherButton"] {display: none !important;}
     
     /* 3. 상단 헤더는 건드리지 않음 (주석 처리) -> 화살표 나옴 */
     /* header {visibility: hidden;} */
