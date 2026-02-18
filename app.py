@@ -484,6 +484,8 @@ def build_detailed_stats_string(data):
     df_bat = data.get("df_bat")
     df_vibe = data.get("df_vibe")
     err_messages = data.get("err_messages", [])
+    parm_values = data.get("parm_values", {})
+    mode_history = data.get("mode_history", [])
 
     # Flight time (minutes)
     flight_minutes = "N/A"
@@ -542,6 +544,20 @@ def build_detailed_stats_string(data):
     else:
         errors_text = "None"
 
+    parm_summary = "None"
+    if parm_values:
+        important_keys = ["INS_GYRO_FILTER", "ATC_RAT_RLL_P", "ATC_RAT_PIT_P", "ATC_RAT_YAW_P", "PSC_ACCZ_P", "PSC_ACCZ_I"]
+        known = [f"{k}={parm_values[k]}" for k in important_keys if k in parm_values]
+        if known:
+            parm_summary = ", ".join(known)
+        else:
+            parm_summary = f"{len(parm_values)} parameters parsed"
+
+    mode_summary = "None"
+    if mode_history:
+        recent_modes = [m.get("mode", "UNKNOWN") for m in mode_history[-8:]]
+        mode_summary = " -> ".join(recent_modes)
+
     detailed_stats = f"""
 Flight Time: {flight_minutes}
 Battery Health:
@@ -555,6 +571,10 @@ Motor Balance:
   - {motor_balance}
 GPS Health:
   - {gps_health}
+Parameters:
+  - {parm_summary}
+Mode Changes:
+  - {mode_summary}
 Errors:
 {errors_text}
 """.strip()
@@ -714,19 +734,33 @@ def analyze_log_file(file_bytes: bytes):
         arm_events = []
         gps_time_us = []
         parm_time_us = []
+        parm_values = {}
+        mode_history = []
+        sys_messages = []
+        message_type_counts = {}
         
         for msg in _parse_message_stream(master):
             message_count += 1
             msg_type = msg.get_type()
             message_types.add(msg_type)
+            message_type_counts[msg_type] = message_type_counts.get(msg_type, 0) + 1
 
             if msg_type == "PARM":
                 has_parm = True
                 parm_time = _extract_time_us(msg)
                 if parm_time is not None:
                     parm_time_us.append(parm_time)
+                parm_name = _safe_getattr(msg, "Name", "name")
+                parm_value = _safe_getattr(msg, "Value", "value")
+                if parm_name is not None and parm_value is not None:
+                    try:
+                        parm_values[str(parm_name)] = float(parm_value)
+                    except (TypeError, ValueError):
+                        pass
             elif msg_type == "MSG":
                 has_msg = True
+                if len(sys_messages) < 200:
+                    sys_messages.append(str(msg))
             elif msg_type == "ERR" and len(err_messages) < 50:
                 err_messages.append(str(msg))
             elif msg_type == "EV" and len(ev_messages) < 50:
@@ -739,6 +773,18 @@ def analyze_log_file(file_bytes: bytes):
                     ev_value_int = None
                 if ev_value_int in (10, 11) and ev_time is not None:
                     arm_events.append((ev_time, ev_value_int))
+            elif msg_type in ("MODE", "MODE2"):
+                mode_name = _safe_getattr(msg, "Mode", "mode", "ModeName", "modename")
+                mode_num = _safe_getattr(msg, "ModeNum", "modenum", "ModeNumber", "modenumber")
+                mode_time = _extract_time_us(msg)
+                if len(mode_history) < 200:
+                    mode_history.append(
+                        {
+                            "time_us": mode_time,
+                            "mode": str(mode_name) if mode_name is not None else "UNKNOWN",
+                            "mode_num": int(mode_num) if mode_num is not None else None,
+                        }
+                    )
             elif msg_type in GPS_MESSAGE_TYPES:
                 gps_time = _extract_time_us(msg)
                 if gps_time is not None:
@@ -858,6 +904,10 @@ def analyze_log_file(file_bytes: bytes):
             'log_summary': generate_log_summary(file_path),
             'err_messages': err_messages,
             'ev_messages': ev_messages,
+            'parm_values': parm_values,
+            'mode_history': mode_history,
+            'sys_messages': sys_messages,
+            'message_type_counts': message_type_counts,
         }
     
     finally:
@@ -892,6 +942,10 @@ if uploaded_file is not None:
     df_bat = data['df_bat']
     err_messages = data.get('err_messages', [])
     ev_messages = data.get('ev_messages', [])
+    parm_values = data.get("parm_values", {})
+    mode_history = data.get("mode_history", [])
+    sys_messages = data.get("sys_messages", [])
+    message_type_counts = data.get("message_type_counts", {})
     
     # Display file info
     st.write(f"**File size:** {file_size:,} bytes ({file_size / 1024:.2f} KB)")
@@ -924,6 +978,9 @@ if uploaded_file is not None:
         st.info("Log contains configuration/MSG records (PARM/MSG), which is typical for Ardupilot DataFlash logs.")
     elif message_count > 0:
         st.warning("No PARM or MSG records were found. The file may still be valid, but this is less common.")
+
+    st.write(f"**Parameters parsed:** {len(parm_values):,}")
+    st.write(f"**Mode changes parsed:** {len(mode_history):,}")
     
     st.markdown("### Flight Analysis Dashboard")
     tab_map, tab_charts, tab_chat = st.tabs(["🗺️ Map", "📊 Charts", "🤖 AI Chat"])
@@ -1047,6 +1104,34 @@ if uploaded_file is not None:
             )
         else:
             st.info("No ERR/EV records found in this log.")
+
+        st.write("#### ⚙️ Parsed Parameters & Details")
+        if parm_values:
+            with st.expander(f"PARM values ({len(parm_values):,})", expanded=False):
+                parm_df = pd.DataFrame(
+                    [{"Parameter": k, "Value": v} for k, v in sorted(parm_values.items())]
+                )
+                st.dataframe(parm_df, use_container_width=True, height=320)
+        else:
+            st.info("No PARM values were parsed.")
+
+        if mode_history:
+            with st.expander(f"Mode history ({len(mode_history):,})", expanded=False):
+                mode_df = pd.DataFrame(mode_history)
+                if "time_us" in mode_df.columns:
+                    mode_df["TimeS"] = (mode_df["time_us"] - mode_df["time_us"].min()) / 1e6
+                st.dataframe(mode_df, use_container_width=True, height=220)
+
+        if sys_messages:
+            with st.expander(f"System messages MSG ({len(sys_messages):,})", expanded=False):
+                st.dataframe(pd.DataFrame({"MSG": sys_messages}), use_container_width=True, height=220)
+
+        if message_type_counts:
+            with st.expander("Message type counts", expanded=False):
+                type_df = pd.DataFrame(
+                    [{"MessageType": k, "Count": v} for k, v in sorted(message_type_counts.items())]
+                )
+                st.dataframe(type_df, use_container_width=True, height=260)
 
     with tab_map:
         st.write("#### 🗺️ 3D Flight Path (Google Hybrid)")
