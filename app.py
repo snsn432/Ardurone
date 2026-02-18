@@ -1146,7 +1146,7 @@ if uploaded_file is not None:
                                 log_context = build_detailed_stats_string(st.session_state.analyzed_data)
                             safe_context = _safe_unicode_text(log_context)
                             messages_payload = [
-                                {"role": "system", "content": f"You are a Senior ArduPilot log analyst. The log file is already uploaded and parsed. Do not ask the user to provide the .bin file. Provide a detailed, expert-level analysis with clear technical reasoning, cite relevant metrics from the data, explain likely causes, and give prioritized actionable recommendations. Use the user's language. Analyze this data: {safe_context}"},
+                                {"role": "system", "content": f"You are a Senior ArduPilot log analyst for Pixhawk-based aircraft. Assume the vehicle uses ArduPilot unless explicitly stated otherwise. The log file is already uploaded and parsed. Do not ask the user to provide the .bin file. Provide detailed, expert-level analysis with clear technical reasoning, cite relevant metrics from the data, explain likely causes, and give prioritized actionable recommendations focused on internal settings (PID/tuning, filter settings, EKF and sensor parameters, failsafe and mode parameters, battery and power settings, notch/filter configuration, and control loop setup). Minimize advice about external physical factors unless absolutely necessary and clearly label such advice as secondary. Use the user's language. Analyze this data: {safe_context}"},
                                 *[
                                     {"role": m["role"], "content": _safe_unicode_text(m["content"])}
                                     for m in st.session_state.messages
